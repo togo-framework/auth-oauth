@@ -59,6 +59,18 @@ func init() {
 		}
 		k.Router.Get("/api/auth/oauth/{provider}", redirectHandler())
 		k.Router.Get("/api/auth/oauth/{provider}/callback", callbackHandler(svc))
+
+		// Advertise only the providers that are actually configured.
+		for name := range providers {
+			if id, _ := clientCreds(name); id != "" {
+				auth.RegisterLoginMethod(auth.LoginMethod{
+					Name:  name,
+					Label: "Continue with " + strings.ToUpper(name[:1]) + name[1:],
+					Type:  "oauth",
+					URL:   "/api/auth/oauth/" + name,
+				})
+			}
+		}
 		return nil
 	})
 }
