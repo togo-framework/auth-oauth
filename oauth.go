@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,28 +26,36 @@ import (
 
 type provider struct {
 	authURL, exchangeURL, userinfoURL, scope, emailField string
+	// verifiedField names the userinfo field that says the provider has verified the
+	// address. When set, a login whose address is not verified is refused: the email
+	// is what links the login to an existing account, so an unverified one would let
+	// anyone who can create a provider account with a victim's address sign in as them.
+	verifiedField string
 }
 
 var providers = map[string]provider{
 	"google": {
-		authURL: "https://accounts.google.com/o/oauth2/v2/auth",
+		authURL:     "https://accounts.google.com/o/oauth2/v2/auth",
 		exchangeURL: "https://oauth2.googleapis.com/token",
 		userinfoURL: "https://www.googleapis.com/oauth2/v2/userinfo",
-		scope: "openid email profile", emailField: "email",
+		scope:       "openid email profile", emailField: "email", verifiedField: "verified_email",
 	},
 	"github": {
-		authURL: "https://github.com/login/oauth/authorize",
+		authURL:     "https://github.com/login/oauth/authorize",
 		exchangeURL: "https://github.com/login/oauth/access_token",
 		userinfoURL: "https://api.github.com/user", scope: "read:user user:email", emailField: "email",
 	},
 	"facebook": {
-		authURL: "https://www.facebook.com/v18.0/dialog/oauth",
+		authURL:     "https://www.facebook.com/v18.0/dialog/oauth",
 		exchangeURL: "https://graph.facebook.com/v18.0/oauth/access_token",
 		userinfoURL: "https://graph.facebook.com/me?fields=email", scope: "email", emailField: "email",
 	},
 }
 
 var httpClient = &http.Client{Timeout: 15 * time.Second}
+
+// errUnverified is returned when the provider has not verified the address.
+var errUnverified = fmt.Errorf("the provider has not verified this email address")
 
 func init() {
 	togo.RegisterProviderFunc("auth-oauth", togo.PriorityLate+20, func(k *togo.Kernel) error {
@@ -118,8 +127,10 @@ func callbackHandler(svc *auth.Service) http.HandlerFunc {
 			http.Error(w, "unknown provider", http.StatusNotFound)
 			return
 		}
-		// CSRF: state cookie must match the query.
+		// CSRF: state cookie must match the query. It is single-use: cleared here
+		// whatever happens next, so a captured callback URL cannot be replayed.
 		c, err := r.Cookie("oauth_state")
+		http.SetCookie(w, &http.Cookie{Name: "oauth_state", Value: "", Path: "/", HttpOnly: true, MaxAge: -1, SameSite: http.SameSiteLaxMode}) //#nosec G124 -- clearing the state cookie
 		if err != nil || c.Value == "" || c.Value != r.URL.Query().Get("state") {
 			http.Error(w, "invalid oauth state", http.StatusBadRequest)
 			return
@@ -131,6 +142,10 @@ func callbackHandler(svc *auth.Service) http.HandlerFunc {
 			return
 		}
 		email, err := fetchEmail(r.Context(), name, p, token)
+		if errors.Is(err, errUnverified) {
+			http.Error(w, "this "+name+" account's email address is not verified", http.StatusForbidden)
+			return
+		}
 		if err != nil || email == "" {
 			http.Error(w, "could not resolve email from provider", http.StatusBadGateway)
 			return
@@ -144,8 +159,19 @@ func callbackHandler(svc *auth.Service) http.HandlerFunc {
 			http.Error(w, "session failed", http.StatusInternalServerError)
 			return
 		}
-		http.Redirect(w, r, "/dashboard", http.StatusFound)
+		http.Redirect(w, r, afterLogin(), http.StatusFound)
 	}
+}
+
+// afterLogin is where a successful login lands: OAUTH_AFTER_LOGIN, default /dashboard.
+// Only a path on this site is accepted ("/x", never "//host" or "https://…"), so the
+// setting cannot be turned into an open redirect.
+func afterLogin() string {
+	v := strings.TrimSpace(os.Getenv("OAUTH_AFTER_LOGIN"))
+	if v == "" || !strings.HasPrefix(v, "/") || strings.HasPrefix(v, "//") || strings.HasPrefix(v, "/\\") {
+		return "/dashboard"
+	}
+	return v
 }
 
 func exchange(ctx context.Context, name string, p provider, code string) (string, error) {
@@ -185,6 +211,11 @@ func fetchEmail(ctx context.Context, name string, p provider, token string) (str
 		return "", err
 	}
 	if e, ok := m[p.emailField].(string); ok && e != "" {
+		if p.verifiedField != "" {
+			if v, _ := m[p.verifiedField].(bool); !v {
+				return "", errUnverified
+			}
+		}
 		return e, nil
 	}
 	// GitHub: email may be private — fall back to /user/emails.
